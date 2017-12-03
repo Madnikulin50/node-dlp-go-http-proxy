@@ -26,8 +26,25 @@ type IcapClientSetting struct {
 	preview int
 }
 
-icapSettings := IcapClientSetting{"127.0.0.1:1344", true, true, -1}
+var icapSettings = IcapClientSetting{"127.0.0.1:1344", true, true, -1}
 
+
+type IcapConnection struct {
+	conn     *net.Conn
+}
+
+var icapSessionsMap = make(map[int64]*IcapConnection)
+
+type Meta struct {
+	req      *http.Request
+	resp     *http.Response
+	err      error
+	t        time.Time
+	sess     int64
+	bodyPath string
+	from     string
+	conn     *IcapConnection
+}
 
 type FileStream struct {
 	path string
@@ -35,8 +52,8 @@ type FileStream struct {
 	meta *Meta
 }
 
-func NewFileStream(path string) *FileStream {
-	return &FileStream{path, nil}
+func NewFileStream(path string, meta *Meta) *FileStream {
+	return &FileStream{path, nil, meta}
 }
 
 func (fs *FileStream) Write(b []byte) (nr int, err error) {
@@ -46,17 +63,16 @@ func (fs *FileStream) Write(b []byte) (nr int, err error) {
 		if err != nil {
 			return 0, err
 		}
-		firstTime = true
 	}
 
-	if (fs.meta.conn == nil) {
+	/* if fs.meta.conn == nil {
 		conn, err := net.Dial("tcp", icapSettings.address)
 		if err != nil {
 			return 0, err
 		}
 		fs.meta.conn = &conn
-		
-	}
+
+	} */
 	return fs.f.Write(b)
 }
 
@@ -68,16 +84,7 @@ func (fs *FileStream) Close() error {
 	return fs.f.Close()
 }
 
-type Meta struct {
-	req      *http.Request
-	resp     *http.Response
-	err      error
-	t        time.Time
-	sess     int64
-	bodyPath string
-	from     string
-	conn     *net.Conn
-}
+
 
 func fprintf(nr *int64, err *error, w io.Writer, pat string, a ...interface{}) {
 	if *err != nil {
@@ -127,6 +134,37 @@ func (m *Meta) WriteTo(w io.Writer) (nr int64, err error) {
 	return
 }
 
+func (m *Meta) SendIcap() (err error) {
+	if m.conn.conn == nil {
+		conn, err := net.Dial("tcp", icapSettings.address)
+		if err != nil {
+			return err
+		}
+		m.conn.conn = &conn
+	}
+	if m.resp == nil {
+		buf, err2 := httputil.DumpRequest(m.req, false)
+		if err2 != nil {
+			return err2
+		}
+		fmt.Fprintf(*m.conn.conn, "REQMOD icap://%v/reqmode ICAP/1.0\r\nHost: %v\r\nEncapsulated: req-hdr=0, null-body=%d\r\n\r\n%s",
+			icapSettings.address, icapSettings.address, len(buf), buf)
+	} else if m.resp != nil && icapSettings.respmode {
+		bufReq, err2 := httputil.DumpRequest(m.req, false)
+		if err2 != nil {
+			return err2
+		}
+		bufResp, err2 := httputil.DumpResponse(m.resp, false)
+		if err2 != nil {
+			return err2
+		}
+		fmt.Fprintf(*m.conn.conn, "RESPMOD icap://%v/respmode\r\nHost: %v\r\nEncapsulated: req-hdr=0, resp-hdr=%d, null-body=%d\r\n\r\n%s%s",
+			icapSettings.address, icapSettings.address, len(bufReq), len(bufReq) + len(bufResp), bufReq, bufResp)
+	}
+
+	return
+}
+
 // IcapClient is an asynchronous HTTP request/response logger. It traces
 // requests and responses headers in a "log" file in logger directory and dumps
 // their bodies in files prefixed with the session identifiers.
@@ -170,6 +208,9 @@ func NewIcapClient(basepath string) (*IcapClient, error) {
 		for m := range logger.c {
 			if _, err := m.WriteTo(f); err != nil {
 				log.Println("Can't write meta", err)
+			}
+			if err := m.SendIcap(); err != nil {
+				log.Println("Can't write icap", err)
 			}
 		}
 		logger.errch <- f.Close()
@@ -215,45 +256,54 @@ func (logger *IcapClient) LogResp(resp *http.Response, ctx *goproxy.ProxyCtx) {
 	if ctx.UserData != nil {
 		from = ctx.UserData.(*transport.RoundTripDetails).TCPAddr.String()
 	}
-	if resp == nil {
-		resp = emptyResp
-	} else {
+	inResp := resp
+	if inResp == nil {
+		inResp = emptyResp
+	}
+	meta := Meta{
+		req: ctx.Req,
+		resp: inResp,
+		err:  ctx.Error,
+		t:    time.Now(),
+		sess: ctx.Session,
+		from: from,
+		conn: &IcapConnection{}}
+
+	if resp != nil {
 		if resp.ContentLength > 0 ||
 					resp.ContentLength == -1 {
 			contentType := resp.Header.Get("Content-Type")
 			body := path.Join(logger.path, fmt.Sprintf("%d_resp.%s", ctx.Session, getExtensionFromContentType(contentType)))
-			resp.Body = NewTeeReadCloser(resp.Body, NewFileStream(body))
+			resp.Body = NewTeeReadCloser(resp.Body, NewFileStream(body, &meta))
 		}
 
 	}
-	logger.LogMeta(&Meta{
-		resp: resp,
-		err:  ctx.Error,
-		t:    time.Now(),
-		sess: ctx.Session,
-		from: from})
+	logger.LogMeta(&meta)
 }
 
 var emptyResp = &http.Response{}
 var emptyReq = &http.Request{}
 
 func (logger *IcapClient) LogReq(req *http.Request, ctx *goproxy.ProxyCtx) {
-	if req == nil {
-		req = emptyReq
-	} else {
-		if (req.ContentLength > 0 || req.ContentLength == -1) {
-			contentType := req.Header.Get("Content-Type")
-			body := path.Join(logger.path, fmt.Sprintf("%d_req.%s", ctx.Session, getExtensionFromContentType(contentType)))
-			req.Body = NewTeeReadCloser(req.Body, NewFileStream(body))
-		}
-
+	inReq := req
+	if inReq == nil {
+		inReq = emptyReq
 	}
-	logger.LogMeta(&Meta{
-		req:  req,
+	meta := Meta{
+		req:  inReq,
 		err:  ctx.Error,
 		t:    time.Now(),
 		sess: ctx.Session,
-		from: req.RemoteAddr})
+		from: req.RemoteAddr,
+		conn: &IcapConnection{}}
+	if req != nil {
+		if req.ContentLength > 0 || req.ContentLength == -1 {
+			contentType := req.Header.Get("Content-Type")
+			body := path.Join(logger.path, fmt.Sprintf("%d_req.%s", ctx.Session, getExtensionFromContentType(contentType)))
+			req.Body = NewTeeReadCloser(req.Body, NewFileStream(body, &meta))
+		}
+	}
+	logger.LogMeta(&meta)
 }
 
 func (logger *IcapClient) LogMeta(m *Meta) {
